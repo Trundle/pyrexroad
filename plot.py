@@ -240,15 +240,14 @@ class _Parser:
                 if self._expect(sre_constants.FAILURE):
                     return In(op.pos, skip, ranges)
 
-    def info(self):
+    def info(self) -> Optional[Info]:
         if op := self._expect(sre_constants.INFO):
-            if (skip := self.int()) is not None:
-                if (flags := self.int()) is not None:
-                    if (min_width := self.int()) is not None:
-                        if (max_width := self.int()) is not None:
-                            for _ in range(skip - 4):
-                                self.tokenizer.next_token()
-                            return Info(op.pos, skip, flags, min_width, max_width)
+            (skip, flags, min_width, max_width) = self._ints(4)
+            if max_width is not None:
+                for _ in range(skip - 4):
+                    self.tokenizer.next_token()
+                return Info(op.pos, skip, flags, min_width, max_width)
+        return None
 
     def jump(self):
         if op := self._expect(sre_constants.JUMP):
@@ -267,56 +266,48 @@ class _Parser:
 
     def range(self):
         if op := self._expect(sre_constants.RANGE):
-            if (min_char := self.int()) is not None:
-                if (max_char := self.int()) is not None:
-                    return Range(op.pos, min_char, max_char)
+            (min_char, max_char) = self._ints(2)
+            if max_char is not None:
+                return Range(op.pos, min_char, max_char)
 
     def repeat(self):
         if op := self._expect(sre_constants.REPEAT):
-            if (skip := self.int()) is not None:
-                if (min_times := self.int()) is not None:
-                    if (max_times := self.int()) is not None:
-                        with self.tokenizer.limit_to_next(skip - 1):
-                            if (body := self.ops()) is not None:
+            (skip, min_times, max_times) = self._ints(3)
+            if max_times is not None:
+                with self.tokenizer.limit_to_next(skip - 1):
+                    if (body := self.ops()) is not None:
 
-                                def constant(value):
-                                    def match():
-                                        if token := self._expect(value):
-                                            return token.value
+                        def constant(value):
+                            def match():
+                                if token := self._expect(value):
+                                    return token.value
 
-                                    return match
+                            return match
 
-                                if (
-                                    epilogue := self._alt(
-                                        constant(sre_constants.MAX_UNTIL),
-                                        constant(sre_constants.MIN_UNTIL),
-                                    )
-                                ) is not None:
-                                    return Repeat(
-                                        op.pos,
-                                        skip,
-                                        min_times,
-                                        max_times,
-                                        body,
-                                        epilogue,
-                                    )
+                        epilogue = self._alt(
+                            constant(sre_constants.MAX_UNTIL),
+                            constant(sre_constants.MIN_UNTIL),
+                        )
+                        if epilogue is not None:
+                            return Repeat(
+                                op.pos, skip, min_times, max_times, body, epilogue
+                            )
 
     def repeat_one(self):
         if op := self._expect(sre_constants.REPEAT_ONE):
-            if (skip := self.int()) is not None:
-                if (min_times := self.int()) is not None:
-                    if (max_times := self.int()) is not None:
-                        with self.tokenizer.limit_to_next(skip - 1):
-                            if (loop_op := self.op()) is not None:
-                                if success := self.success():
-                                    return RepeatOne(
-                                        op.pos,
-                                        skip,
-                                        min_times,
-                                        max_times,
-                                        loop_op,
-                                        success,
-                                    )
+            (skip, min_times, max_times) = self._ints(3)
+            if max_times is not None:
+                with self.tokenizer.limit_to_next(skip - 1):
+                    if (loop_op := self.op()) is not None:
+                        if success := self.success():
+                            return RepeatOne(
+                                op.pos,
+                                skip,
+                                min_times,
+                                max_times,
+                                loop_op,
+                                success,
+                            )
 
     def success(self):
         if op := self._expect(sre_constants.SUCCESS):
@@ -326,6 +317,19 @@ class _Parser:
         if isinstance(self.tokenizer.peek_token(), int):
             return self.tokenizer.next_token().value
         return None
+
+    def _ints(self, n):
+        """
+        Expect to match `n` ints next. If a match fails, returns `None` for the
+        remaining matches so that it can be used in an unpacking expression.
+        """
+        for i in range(n):
+            value = self.int()
+            yield value
+            if value is None:
+                break
+        for _ in range(i + 1, n):
+            yield None
 
     def _alt(self, *branches):
         for branch in branches:
