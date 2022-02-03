@@ -3,10 +3,12 @@ from __future__ import annotations
 import sre_constants
 import sre_parse
 import sre_compile
-from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from itertools import count
-from typing import DefaultDict, Iterable, List, Optional, Sequence, Tuple
+from functools import singledispatchmethod
+from itertools import groupby
+from typing import Optional, Sequence
+
+import railroad as rr
 
 
 @dataclass
@@ -86,7 +88,7 @@ class At(Op):
 
 @dataclass(eq=False)
 class Branch(Op):
-    branches: List[List[Op]]
+    branches: list[list[Op]]
 
 
 @dataclass(eq=False)
@@ -95,9 +97,15 @@ class Failure(Op):
 
 
 @dataclass(eq=False)
+class GroupRef(Op):
+    group: int
+
+
+@dataclass(eq=False)
 class In(Op):
     skip: int
-    ranges: List[Op]
+    negate: bool
+    ranges: list[Op]
 
 
 @dataclass(eq=False)
@@ -134,7 +142,7 @@ class Repeat(Op):
     skip: int
     min_times: int
     max_times: int
-    body: List[Op]
+    body: list[Op]
     epilogue: int
 
 
@@ -177,6 +185,7 @@ class _Parser:
             self.at,
             self.branch,
             self.failure,
+            self.group_ref,
             self.in_,
             self.info,
             self.jump,
@@ -188,7 +197,7 @@ class _Parser:
             self.success,
         )
 
-    def ops(self) -> Optional[List[Op]]:
+    def ops(self) -> Optional[list[Op]]:
         return self._loop(self.op)
 
     def any(self) -> Optional[Any]:
@@ -206,6 +215,13 @@ class _Parser:
                 where := self._alt(
                     e(sre_constants.AT_BEGINNING),
                     e(sre_constants.AT_BEGINNING_LINE),
+                    e(sre_constants.AT_BEGINNING_STRING),
+                    e(sre_constants.AT_BOUNDARY),
+                    e(sre_constants.AT_LOC_BOUNDARY),
+                    e(sre_constants.AT_LOC_NON_BOUNDARY),
+                    e(sre_constants.AT_NON_BOUNDARY),
+                    e(sre_constants.AT_UNI_BOUNDARY),
+                    e(sre_constants.AT_UNI_NON_BOUNDARY),
                     e(sre_constants.AT_END_LINE),
                     e(sre_constants.AT_END_STRING),
                     e(sre_constants.AT_END),
@@ -232,13 +248,22 @@ class _Parser:
         if op := self._expect(sre_constants.FAILURE):
             return Failure(op.pos)
 
+    def group_ref(self):
+        if op := self._expect(sre_constants.GROUPREF):
+            if (group := self.int()) is not None:
+                return GroupRef(op.pos, group)
+
     def in_(self):
         if op := self._expect(sre_constants.IN):
             if (skip := self.int()) is not None:
-                with self.tokenizer.limit_to_next(skip - 2):
+                negate = False
+                if self.tokenizer.peek_token() == sre_constants.NEGATE:
+                    self.tokenizer.next_token()
+                    negate = True
+                with self.tokenizer.limit_to_next(skip - 2 - negate):
                     ranges = self.ops()
                 if self._expect(sre_constants.FAILURE):
-                    return In(op.pos, skip, ranges)
+                    return In(op.pos, skip, negate, ranges)
 
     def info(self) -> Optional[Info]:
         if op := self._expect(sre_constants.INFO):
@@ -348,216 +373,179 @@ class _Parser:
             return nodes
 
 
-## Automaton
+## Plotting
 
 
-@dataclass(eq=False)
-class State:
-    """
-    A state in an NFA.
-    """
+@dataclass
+class _Group:
+    group: int
+    ops: list[Op]
 
-    transitions: List[Tuple[CharacterBag, State]] = field(default_factory=list)
-    descr: Optional[str] = None
-    _shape: Optional[str] = None
 
-    def add_transition(self, char: CharacterBag, state: State):
-        self.transitions.append((char, state))
+@dataclass
+class _LiteralSeq:
+    literals: list[Literal]
 
-    def only_epsilon_transition(self):
-        return (
-            len(self.transitions) == 1
-            and CharacterBag.epsilon() == self.transitions[0][0]
+
+class _Plotter:
+    def __init__(self):
+        self._expected_jumps = []
+
+    def plot(self, code):
+        return self._visit_op_seq(code)
+
+    def _visit_op_seq(self, code):
+        nodes = []
+        for op in self._groupify(self._simplify(code)):
+            if (node := self._visit(op)) is not None:
+                nodes.append(node)
+        return rr.Sequence(*nodes)
+
+    def _simplify(self, code):
+        for (is_literal, ops) in groupby(code, key=lambda op: isinstance(op, Literal)):
+            if is_literal:
+                yield _LiteralSeq(list(ops))
+            else:
+                yield from ops
+
+    def _groupify(self, code):
+        code = list(code)
+        marks = dict(
+            (op.group, i) for (i, op) in enumerate(code) if isinstance(op, Mark)
         )
-
-    def dump(self) -> Iterable[str]:
-        state_number = count()
-        state_names: DefaultDict[State, str] = defaultdict(
-            lambda: f"p{next(state_number)}"
-        )
-        yield "digraph {"
-        for state in _find_all(self, lambda _: True):
-            if state._shape or state.descr:
-                attrs = ",".join(
-                    f'{k}="{v}"'
-                    for (k, v) in {("shape", state._shape), ("label", state.descr)}
-                    if v
-                )
-                yield f"  {state_names[state]} [{attrs}]"
-            for (char, new_state) in state.transitions:
-                label = char.range_repr()
-                yield f'  {state_names[state]} -> {state_names[new_state]} [label="{label}"]'
-        yield "}"
-
-
-@dataclass(eq=False)
-class AcceptingState(State):
-    _shape = "doublecircle"
-
-
-@dataclass(eq=False)
-class Kleene(State):
-    pass
-
-
-# Some special characters
-epsilon = object()
-at_end = object()
-
-
-class CharacterBag:
-    @classmethod
-    def epsilon(cls):
-        return cls([], epsilon=True)
-
-    @classmethod
-    def range(cls, start: int, stop: int):
-        if start < 0:
-            raise ValueError("start < 0")
-        elif start > stop:
-            raise ValueError("start must be smaller or equal to stop")
-        return cls([(start, stop)])
-
-    @classmethod
-    def singleton(cls, character):
-        if character is epsilon:
-            return cls.epsilon()
+        if marks:
+            (group, start) = next(iter(marks.items()))
+            if group % 2:
+                raise ValueError(f"Groups should start with an even mark, got {group}")
+            end = marks[group + 1]
+            yield from code[:start]
+            yield _Group(group // 2 + 1, list(self._groupify(code[start + 1 : end])))
+            yield from self._groupify(code[end + 1 :])
         else:
-            return cls.range(character, character)
+            yield from code
 
-    def __init__(self, ranges, epsilon=False):
-        self._contains_epsilon = epsilon
-        self._ranges = self._merge_ranges(sorted(ranges))
+    @singledispatchmethod
+    def _visit(self, op):
+        raise NotImplementedError(op)
 
-    def min(self):
-        return self._ranges[0][0]
+    @_visit.register
+    def _visit_any(self, op: Any):
+        return rr.Terminal("<any>")
 
-    def __bool__(self):
-        return self._contains_epsilon or bool(self._ranges)
+    @_visit.register
+    def _visit_at(self, op: At):
+        descriptions = {
+            sre_constants.AT_BEGINNING: "start of string",
+            sre_constants.AT_BEGINNING_STRING: "beginning of string",
+            sre_constants.AT_END: "end of string",
+            sre_constants.AT_END_STRING: "end of string",
+            sre_constants.AT_UNI_BOUNDARY: "at word boundary",
+            sre_constants.AT_UNI_NON_BOUNDARY: "not at word boundary",
+        }
+        return rr.Terminal(f"<{descriptions[op.where]}>")
 
-    def __eq__(self, other):
-        if isinstance(other, CharacterBag):
-            return (
-                self._ranges == other._ranges
-                and self._contains_epsilon == other._contains_epsilon
+    @_visit.register
+    def _visit_branch(self, op: Branch):
+        targets = set()
+        branches = []
+        optional = False
+        for branch in op.branches:
+            jump = branch[-1]
+            if not isinstance(jump, Jump):
+                raise ValueError("Last op in branch not a jump")
+            targets.add(jump.pos + jump.skip)
+            if len(branch) > 1:
+                self._expected_jumps.append(jump)
+                branches.append(self._visit_op_seq(branch))
+            else:
+                optional = True
+        # XXX verify that target is actually next op?
+        if len(targets) != 1:
+            raise ValueError("Not all branches jump to same target")
+        if not branches:
+            return None
+        node = rr.Choice(0, *branches)
+        if optional:
+            node = rr.Optional(node)
+        return node
+
+    @_visit.register
+    def _visit_group_ref(self, op: GroupRef):
+        return rr.Terminal(f"<group {op.group + 1}>")
+
+    @_visit.register
+    def _visit_in(self, op: In):
+        negate = "not " if op.negate else ""
+        return rr.Terminal(
+            negate
+            + " or ".join(
+                f"{chr(r.min_char)} - {chr(r.max_char)}"
+                if isinstance(r, Range)
+                else self._literal_str(r)
+                for r in op.ranges
             )
-        return NotImplemented
-
-    def range_repr(self) -> str:
-        if (
-            not self._contains_epsilon
-            and len(self._ranges) == 1
-            and self.min() == self._ranges[0][1]
-        ):
-            return chr(self.min())
-        elif not self._ranges and self._contains_epsilon:
-            return "ε"
-        else:
-            ranges_repr = ", ".join(
-                f"{chr(start)}-{chr(stop)}" for (start, stop) in self._ranges
-            )
-            epsilon_repr = ", ε" if self._contains_epsilon else ""
-            return f"[{ranges_repr}]{epsilon_repr}"
-
-    def __repr__(self):
-        return f"<CharacterBag({self.range_repr()})>"
-
-    @staticmethod
-    def _merge_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        if len(ranges) < 2:
-            return ranges
-
-        def merge():
-            (prev_start, prev_stop) = ranges[0]
-            for (start, stop) in ranges[1:]:
-                if start > prev_stop:
-                    yield (prev_start, prev_stop)
-                    prev_start = start
-                prev_stop = stop
-            yield (prev_start, prev_stop)
-
-        return list(merge())
-
-
-def _find_all(entry_state, predicate):
-    seen = set()
-    to_do = deque([entry_state])
-    while to_do:
-        state = to_do.pop()
-        seen.add(state)
-        if predicate(state):
-            yield state
-        to_do.extend(
-            next_state
-            for (_, next_state) in state.transitions
-            if next_state not in seen
         )
 
+    @_visit.register
+    def _visit_info(self, op: Info):
+        pass
 
-def _remove_epsilon_only(nfa: State):
-    """
-    Removes all states that are only entered via an ε transition. Changes the given NFA in-place.
-    """
-    entries = defaultdict(list)
-    for state in _find_all(nfa, lambda _: True):
-        for (char, next_state) in state.transitions:
-            entries[next_state].append((char, state))
-    for (state, from_transitions) in entries.items():
-        if len(from_transitions) == 1:
-            (char, from_state) = from_transitions[0]
-            if char == CharacterBag.epsilon():
-                i = from_state.transitions.index((char, state))
-                from_state.transitions[i : i + 1] = state.transitions
+    @_visit.register
+    def _visit_group(self, op: _Group):
+        return rr.Group(self._visit_op_seq(op.ops), f"Group {op.group}")
 
+    @_visit.register
+    def _visit_jump(self, op: Jump):
+        if (expected := self._expected_jumps.pop()) != op:
+            raise ValueError(f"Unexpected jump: {op}, expected {expected}")
 
-def to_nfa(ops: Sequence[Op]):
-    def visit(op: Op, incoming_state: State):
-        new_state = None
-        if isinstance(op, At):
-            # XXX incomplete / not correct
-            if op.where != sre_constants.AT_BEGINNING:
-                char = {int(sre_constants.AT_END): at_end}[op.where]
-                new_state = State()
-                incoming_state.add_transition(CharacterBag.singleton(char), new_state)
-        elif isinstance(op, Branch):
-            branch_entry_state = State(descr="branch")
-            new_state = branch_exit_state = State(descr="branch end")
-            incoming_state.add_transition(CharacterBag.epsilon(), branch_entry_state)
-            for branch in op.branches:
-                branch_state = State()
-                branch_entry_state.add_transition(CharacterBag.epsilon(), branch_state)
-                assert isinstance(branch[-1], Jump)
-                (_, branch_last_state) = visit_nodes(branch[:-1], branch_state)
-                branch_last_state.add_transition(
-                    CharacterBag.epsilon(), branch_exit_state
-                )
-        elif isinstance(op, Info):
-            # Ignore for now
-            pass
-        elif isinstance(op, Literal):
-            new_state = State(descr="literal matched")
-            incoming_state.add_transition(CharacterBag.singleton(op.literal), new_state)
-        elif isinstance(op, Repeat):
-            new_state = Kleene(descr="*")
-            incoming_state.add_transition(CharacterBag.epsilon(), new_state)
-            (new_state, repeat_end_state) = visit_nodes(op.body, new_state)
-            repeat_end_state.add_transition(CharacterBag.epsilon(), new_state)
-        elif isinstance(op, Success):
-            new_state = AcceptingState()
-            incoming_state.add_transition(CharacterBag.epsilon(), new_state)
+    @_visit.register
+    def _visit_literal(self, op: Literal):
+        return rr.Terminal(self._literal_str(op))
+
+    @_visit.register
+    def _lisit_literal_seq(self, op: _LiteralSeq):
+        return rr.Terminal("".join(self._literal_str(op) for op in op.literals))
+
+    @_visit.register
+    def _visit_mark(self, op: Mark):
+        pass
+
+    @_visit.register
+    def _visit_repeat(self, op: Repeat):
+        return self._visit_repeat_common(op, self._visit_op_seq(op.body))
+
+    @_visit.register
+    def _visit_repeat_one(self, op: RepeatOne):
+        return self._visit_repeat_common(op, self._visit(op.op))
+
+    def _visit_repeat_common(self, op, body):
+        repeat = []
+        kind = rr.OneOrMore if op.min_times != 0 else rr.ZeroOrMore
+        if op.min_times > 1:
+            repeat.append(f"min {op.min_times}")
+        if op.max_times != sre_constants.MAXREPEAT:
+            repeat.append(f"max {op.max_times}")
+        repeat = rr.Comment(", ".join(repeat) + " times") if repeat else None
+        return kind(body, repeat=repeat)
+
+    @_visit.register
+    def _visit_success(self, op: Success):
+        # XXX what to do here?
+        pass
+
+    def _literal_str(self, literal: Literal):
+        char = chr(literal.literal)
+        if char == " ":
+            return "<space>"
+        elif char.isspace():
+            return repr(char)[1:-1]
         else:
-            print(f"[WARN] Unhandled op: {type(op).__name__}")
-        return new_state if new_state is not None else incoming_state
+            return char
 
-    def visit_nodes(ops: Sequence[Op], state: State):
-        start = state
-        for op in ops:
-            state = visit(op, state)
-        return (start, state)
 
-    nfa = visit_nodes(ops, State())[0]
-    _remove_epsilon_only(nfa)
-    return nfa
+def plot(code):
+    return rr.Diagram(_Plotter().plot(code))
 
 
 ## Main
@@ -566,11 +554,10 @@ def to_nfa(ops: Sequence[Op]):
 def plot_re(pattern: str):
     parser = _Parser(_Tokenizer(pattern, 0))
     code = parser.parse()
-    nfa = to_nfa(code)
-    print("\n".join(nfa.dump()))
+    return plot(code)
 
 
 if __name__ == "__main__":
     import sys
 
-    plot_re(sys.argv[1])
+    plot_re(sys.argv[1]).writeSvg(sys.stdout.write)
