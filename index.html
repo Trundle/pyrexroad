@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="pyodide/pyodide.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <main>
+        <h1>How does Python match my regular expression?</h1>
+        <p class="desc">
+            Tracing whether a regular expression matches some input can be difficult. A more visual representation, such as 
+            <a href="https://en.wikipedia.org/wiki/Syntax_diagram">a syntax diagram</a>, sometimes
+            makes it a bit easier.
+            Enter your favourite regular expression, press <span class="i">Show me</span> and enjoy the syntax diagram.
+            The entered expression should follow the <a href="https://docs.python.org/3/library/re.html">re module</a>'s syntax.
+        </p>
+        <p id="loading-indicator">Loading…</p>
+        <script type="text/javascript">
+            let inputElement;
+            let buttonElement;
+            const worker = new Worker('./worker.js');
+            worker.onmessage = (event) => {
+                if (event.data.type === 'initialized') {
+                    const loadingIndicator = document.getElementById('loading-indicator');
+                    loadingIndicator.parentElement.removeChild(loadingIndicator);
+                    if (inputElement.value) {
+                        plot(inputElement.value);
+                        buttonElement.disabled = false;
+                    }
+                } else if (event.data.type === 'plotted') {
+                    document.getElementById('output').innerHTML = event.data.diagram;
+                } else if (event.data.type === 'error') {
+                    document.getElementById('error-msg').innerText = event.data.msg;
+                }
+            };
+
+            const plot = (regex) => {
+                worker.postMessage(regex);
+            };
+
+            function handlePlotRequest() {
+                if (inputElement.value) {
+                    history.pushState({}, '', `?q=${encodeURIComponent(inputElement.value)}`);
+                    plot(inputElement.value);
+                }
+            }
+
+            function handleInput() {
+                document.getElementById('error-msg').innerText = '';
+                buttonElement.disabled = inputElement.value.length == 0;
+            }
+
+            document.addEventListener('DOMContentLoaded', () => {
+                inputElement = document.getElementById('regex-input');
+                buttonElement = document.getElementById('plot-button');
+                const value = new URLSearchParams(window.location.search).get('q');
+                if (value) {
+                    inputElement.value = value;
+                }
+            });
+
+            window.addEventListener('popstate', () => {
+                const value = new URLSearchParams(window.location.search).get('q') || '';
+                document.getElementById('regex-input').value = value;
+                plot(value);
+            });
+        </script>
+        <textarea id="regex-input" placeholder="Enter regex, e.g. (a|b|ab)+c" oninput="handleInput()"></textarea>
+        <p id="error-msg"></p>
+        <input type="button" id="plot-button" value="Show me" onclick="handlePlotRequest()" disabled />
+        <div id="output"></div>
+        <h2>How does it work?</h2>
+        <p class="desc">
+            This site uses a CPython interpreter translated to WebAssembly to
+            first parse and then compile the entered regular expression through
+            the same mechanism that the <span class="i">re</span> module uses.
+            The result are opcodes, i.e. instructions how to match some input.
+            These opcodes are then translated to a railroad diagram.
+        </p>
+    </main>
+    <footer>
+        Made with 🤍 at home. Uses <a href="https://github.com/tabatkins/railroad-diagrams">railroad-diagrams</a> and <a
+            href="https://pyodide.org/">Pyodide</a>.
+    </footer>
+</body>
+
+</html>
