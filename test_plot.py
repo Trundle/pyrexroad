@@ -51,6 +51,8 @@ regex = recursive(
     lambda inner: one_of(
         inner.map(lambda x: f"({x})"),
         inner.map(lambda x: f"(?:{x})"),
+        inner.map(lambda x: f"(?!{x})"),
+        inner.map(lambda x: f"(?={x})"),
         inner.flatmap(lambda x: inner.map(lambda y: f"{x}|{y}")),
         repeat(inner),
         kleene(inner),

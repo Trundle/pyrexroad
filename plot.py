@@ -82,6 +82,20 @@ class Any(Op):
 
 
 @dataclass(eq=False)
+class Assert(Op):
+    skip: int
+    back: int
+    pattern: Op
+
+
+@dataclass(eq=False)
+class AssertNot(Op):
+    skip: int
+    back: int
+    pattern: Op
+
+
+@dataclass(eq=False)
 class At(Op):
     where: int
 
@@ -89,6 +103,11 @@ class At(Op):
 @dataclass(eq=False)
 class Branch(Op):
     branches: list[list[Op]]
+
+
+@dataclass(eq=False)
+class Category(Op):
+    category: int
 
 
 @dataclass(eq=False)
@@ -132,6 +151,11 @@ class Mark(Op):
 
 
 @dataclass(eq=False)
+class NotLiteral(Op):
+    literal: int
+
+
+@dataclass(eq=False)
 class Range(Op):
     min_char: int
     max_char: int
@@ -139,6 +163,7 @@ class Range(Op):
 
 @dataclass(eq=False)
 class Repeat(Op):
+    minimal: bool
     skip: int
     min_times: int
     max_times: int
@@ -153,6 +178,7 @@ class Success(Op):
 
 @dataclass(eq=False)
 class RepeatOne(Op):
+    minimal: bool
     skip: int
     min_times: int
     max_times: int
@@ -182,8 +208,11 @@ class _Parser:
     def op(self):
         return self._alt(
             self.any,
+            self.assert_,
+            self.assert_not,
             self.at,
             self.branch,
+            self.category,
             self.failure,
             self.group_ref,
             self.in_,
@@ -191,6 +220,7 @@ class _Parser:
             self.jump,
             self.literal,
             self.mark,
+            self.not_literal,
             self.range,
             self.repeat,
             self.repeat_one,
@@ -204,6 +234,22 @@ class _Parser:
         if op := self._expect(sre_constants.ANY):
             return Any(op.pos)
         return None
+
+    def assert_(self):
+        if op := self._expect(sre_constants.ASSERT):
+            return self._assert_common(op, Assert)
+
+    def assert_not(self):
+        if op := self._expect(sre_constants.ASSERT_NOT):
+            return self._assert_common(op, AssertNot)
+
+    def _assert_common(self, op, result):
+        skip = self.int()
+        back = self.int()
+        with self.tokenizer.limit_to_next(skip - 3):
+            pattern = self.ops()
+        if self._expect(sre_constants.SUCCESS):
+            return result(op.pos, skip, back, pattern)
 
     def at(self):
         if op := self._expect(sre_constants.AT):
@@ -243,6 +289,11 @@ class _Parser:
                     break
             if skip is not None:
                 return Branch(op.pos, branches)
+
+    def category(self):
+        if op := self._expect(sre_constants.CATEGORY):
+            category = self.int()
+            return Category(op.pos, category)
 
     def failure(self):
         if op := self._expect(sre_constants.FAILURE):
@@ -289,6 +340,11 @@ class _Parser:
             if (group := self.int()) is not None:
                 return Mark(op.pos, group)
 
+    def not_literal(self):
+        if op := self._expect(sre_constants.NOT_LITERAL):
+            if (literal := self.int()) is not None:
+                return NotLiteral(op.pos, literal)
+
     def range(self):
         if op := self._expect(sre_constants.RANGE):
             (min_char, max_char) = self._ints(2)
@@ -296,7 +352,9 @@ class _Parser:
                 return Range(op.pos, min_char, max_char)
 
     def repeat(self):
-        if op := self._expect(sre_constants.REPEAT):
+        if (op := self._expect(sre_constants.REPEAT)) or (
+            op := self._expect(sre_constants.MIN_REPEAT)
+        ):
             (skip, min_times, max_times) = self._ints(3)
             if max_times is not None:
                 with self.tokenizer.limit_to_next(skip - 1):
@@ -315,11 +373,19 @@ class _Parser:
                         )
                         if epilogue is not None:
                             return Repeat(
-                                op.pos, skip, min_times, max_times, body, epilogue
+                                op.pos,
+                                op.value == sre_constants.MIN_REPEAT,
+                                skip,
+                                min_times,
+                                max_times,
+                                body,
+                                epilogue,
                             )
 
     def repeat_one(self):
-        if op := self._expect(sre_constants.REPEAT_ONE):
+        if (op := self._expect(sre_constants.REPEAT_ONE)) or (
+            op := self._expect(sre_constants.MIN_REPEAT_ONE)
+        ):
             (skip, min_times, max_times) = self._ints(3)
             if max_times is not None:
                 with self.tokenizer.limit_to_next(skip - 1):
@@ -327,6 +393,7 @@ class _Parser:
                         if success := self.success():
                             return RepeatOne(
                                 op.pos,
+                                op.value == sre_constants.MIN_REPEAT_ONE,
                                 skip,
                                 min_times,
                                 max_times,
@@ -445,6 +512,16 @@ class _Plotter:
         return rr.Terminal(f"<{descriptions[op.where]}>")
 
     @_visit.register
+    def _visit_assert(self, op: Assert):
+        return rr.Group(
+            self._visit_op_seq(op.pattern), "Must match, but not part of match"
+        )
+
+    @_visit.register
+    def _visit_assert_not(self, op: AssertNot):
+        return rr.Group(self._visit_op_seq(op.pattern), "Must not match")
+
+    @_visit.register
     def _visit_branch(self, op: Branch):
         targets = set()
         branches = []
@@ -476,15 +553,7 @@ class _Plotter:
     @_visit.register
     def _visit_in(self, op: In):
         negate = "not " if op.negate else ""
-        return rr.Terminal(
-            negate
-            + " or ".join(
-                f"{chr(r.min_char)} - {chr(r.max_char)}"
-                if isinstance(r, Range)
-                else self._literal_str(r)
-                for r in op.ranges
-            )
-        )
+        return rr.Terminal(negate + " or ".join(map(self._range_str, op.ranges)))
 
     @_visit.register
     def _visit_info(self, op: Info):
@@ -508,8 +577,8 @@ class _Plotter:
         return rr.Terminal("".join(self._literal_str(op) for op in op.literals))
 
     @_visit.register
-    def _visit_mark(self, op: Mark):
-        pass
+    def _visit_not_literal(self, op: NotLiteral):
+        return rr.Terminal("not " + self._literal_str(op))
 
     @_visit.register
     def _visit_repeat(self, op: Repeat):
@@ -522,11 +591,14 @@ class _Plotter:
     def _visit_repeat_common(self, op, body):
         repeat = []
         kind = rr.OneOrMore if op.min_times != 0 else rr.ZeroOrMore
-        if op.min_times > 1:
+        if op.min_times > 0:
             repeat.append(f"min {op.min_times}")
         if op.max_times != sre_constants.MAXREPEAT:
             repeat.append(f"max {op.max_times}")
-        repeat = rr.Comment(", ".join(repeat) + " times") if repeat else None
+        desc = [", ".join(repeat) + " times"] if repeat else []
+        if op.minimal:
+            desc.append("minimal")
+        repeat = rr.Comment(", ".join(desc)) if desc else None
         return kind(body, repeat=repeat)
 
     @_visit.register
@@ -543,9 +615,17 @@ class _Plotter:
         else:
             return char
 
-
-def plot(code):
-    return rr.Diagram(_Plotter().plot(code))
+    def _range_str(self, op: Op):
+        if isinstance(op, Range):
+            return f"{chr(op.min_char)} - {chr(op.max_char)}"
+        elif isinstance(op, Category):
+            return {
+                sre_constants.CATEGORY_UNI_SPACE: "unicode space",
+                sre_constants.CATEGORY_UNI_NOT_SPACE: "not a unicode space",
+            }[op.category]
+        elif isinstance(op, Literal):
+            return self._literal_str(op)
+        raise ValueError(op)
 
 
 ## Main
@@ -554,7 +634,7 @@ def plot(code):
 def plot_re(pattern: str):
     parser = _Parser(_Tokenizer(pattern, 0))
     code = parser.parse()
-    return plot(code)
+    return rr.Diagram(_Plotter().plot(code))
 
 
 if __name__ == "__main__":
