@@ -39,9 +39,13 @@ class _Tokenizer:
 
     def __init__(self, pattern: str, flags=0):
         c = sre_compile._code  # type: ignore [attr-defined]
-        self.tokens = c(sre_parse.parse(pattern, flags), flags)
+        pattern_obj = sre_parse.parse(pattern, flags)
+        self.tokens = c(pattern_obj, flags)
         self.pos = 0
         self.max_pos = len(self.tokens)
+        self.group_names = {
+            i: name for (name, i) in pattern_obj.state.groupdict.items()
+        }
 
     def peek_token(self):
         if self.pos < self.max_pos:
@@ -148,6 +152,7 @@ class Literal(Op):
 @dataclass(eq=False)
 class Mark(Op):
     group: int
+    name: Optional[str]
 
 
 @dataclass(eq=False)
@@ -338,7 +343,9 @@ class _Parser:
     def mark(self):
         if op := self._expect(sre_constants.MARK):
             if (group := self.int()) is not None:
-                return Mark(op.pos, group)
+                return Mark(
+                    op.pos, group, self.tokenizer.group_names.get((group & -2) + 1)
+                )
 
     def not_literal(self):
         if op := self._expect(sre_constants.NOT_LITERAL):
@@ -446,6 +453,7 @@ class _Parser:
 @dataclass
 class _Group:
     group: int
+    name: Option[str]
     ops: list[Op]
 
 
@@ -486,7 +494,11 @@ class _Plotter:
                 raise ValueError(f"Groups should start with an even mark, got {group}")
             end = marks[group + 1]
             yield from code[:start]
-            yield _Group(group // 2 + 1, list(self._groupify(code[start + 1 : end])))
+            yield _Group(
+                group // 2 + 1,
+                code[start].name,
+                list(self._groupify(code[start + 1 : end])),
+            )
             yield from self._groupify(code[end + 1 :])
         else:
             yield from code
@@ -561,7 +573,8 @@ class _Plotter:
 
     @_visit.register
     def _visit_group(self, op: _Group):
-        return rr.Group(self._visit_op_seq(op.ops), f"Group {op.group}")
+        name = f" ({op.name})" if op.name else ""
+        return rr.Group(self._visit_op_seq(op.ops), f"Group {op.group}{name}")
 
     @_visit.register
     def _visit_jump(self, op: Jump):
