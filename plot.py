@@ -467,7 +467,29 @@ class _Plotter:
         self._expected_jumps = []
 
     def plot(self, code):
-        return self._visit_op_seq(code)
+        diagram = rr.Diagram(self._visit_op_seq(code), type="complex")
+        defs = rr.DiagramItem("defs")
+        self._create_arrowhead_marker().addTo(defs)
+        defs.addTo(diagram)
+        return diagram
+
+    def _create_arrowhead_marker(self):
+        marker = rr.DiagramItem(
+            "marker",
+            {
+                "id": "arrow",
+                "viewBox": "0 0 20 14",
+                "refX": "0",
+                "refY": "3.5",
+                "markerWidth": "10",
+                "markerHeight": "7",
+                "orient": "180",
+            },
+        )
+        p = rr.DiagramItem("polygon")
+        p.attrs["points"] = "0 0, 7 3.5, 0 7"
+        p.addTo(marker)
+        return marker
 
     def _visit_op_seq(self, code):
         nodes = []
@@ -485,9 +507,7 @@ class _Plotter:
 
     def _groupify(self, code):
         code = list(code)
-        marks = dict(
-            (op.group, i) for (i, op) in enumerate(code) if isinstance(op, Mark)
-        )
+        marks = {op.group: i for (i, op) in enumerate(code) if isinstance(op, Mark)}
         if marks:
             (group, start) = next(iter(marks.items()))
             if group % 2:
@@ -509,7 +529,7 @@ class _Plotter:
 
     @_visit.register
     def _visit_any(self, op: Any):
-        return rr.Terminal("<any>")
+        return rr.NonTerminal("<any>")
 
     @_visit.register
     def _visit_at(self, op: At):
@@ -521,7 +541,7 @@ class _Plotter:
             sre_constants.AT_UNI_BOUNDARY: "at word boundary",
             sre_constants.AT_UNI_NON_BOUNDARY: "not at word boundary",
         }
-        return rr.Terminal(f"<{descriptions[op.where]}>")
+        return rr.NonTerminal(f"<{descriptions[op.where]}>")
 
     @_visit.register
     def _visit_assert(self, op: Assert):
@@ -560,12 +580,12 @@ class _Plotter:
 
     @_visit.register
     def _visit_group_ref(self, op: GroupRef):
-        return rr.Terminal(f"<group {op.group + 1}>")
+        return rr.NonTerminal(f"<group {op.group + 1}>")
 
     @_visit.register
     def _visit_in(self, op: In):
         negate = "not " if op.negate else ""
-        return rr.Terminal(negate + " or ".join(map(self._range_str, op.ranges)))
+        return rr.NonTerminal(negate + " or ".join(map(self._range_str, op.ranges)))
 
     @_visit.register
     def _visit_info(self, op: Info):
@@ -591,7 +611,7 @@ class _Plotter:
 
     @_visit.register
     def _visit_not_literal(self, op: NotLiteral):
-        return rr.Terminal("not " + self._literal_str(op))
+        return rr.NonTerminal("not " + self._literal_str(op))
 
     @_visit.register
     def _visit_repeat(self, op: Repeat):
@@ -602,17 +622,53 @@ class _Plotter:
         return self._visit_repeat_common(op, self._visit(op.op))
 
     def _visit_repeat_common(self, op, body):
-        repeat = []
+        # N.B. The description is for the back edge. We matched once already,
+        # hence we always need to subtract by one for the actual number
+        if op.max_times == 0:
+            return rr.Group(body, label="Impossible: must match at most zero times")
+        elif op.max_times == 1:
+            return body
         kind = rr.OneOrMore if op.min_times != 0 else rr.ZeroOrMore
-        if op.min_times > 0:
-            repeat.append(f"min {op.min_times}")
-        if op.max_times != sre_constants.MAXREPEAT:
-            repeat.append(f"max {op.max_times}")
-        desc = [", ".join(repeat) + " times"] if repeat else []
+        if op.min_times == op.max_times:
+            if op.min_times == sre_constants.MAXREPEAT:
+                desc = []
+            else:
+                desc = [
+                    "exactly once"
+                    if op.min_times == 2
+                    else f"exactly {op.min_times - 1} times"
+                ]
+        else:
+            pluralize = op.min_times > 2 or op.max_times > 2
+            count_desc = []
+            if op.min_times > 1:
+                count_desc.append(f"min {op.min_times - 1}")
+            if op.max_times != sre_constants.MAXREPEAT:
+                count_desc.append(
+                    "max " + (str(op.max_times - 1) if op.max_times > 2 else "once")
+                )
+            desc = (
+                [", ".join(count_desc) + (" times" if pluralize else "")]
+                if count_desc
+                else []
+            )
         if op.minimal:
             desc.append("minimal")
-        repeat = rr.Comment(", ".join(desc)) if desc else None
+        # The two spaces at the end are space for the arrow
+        repeat = rr.Comment(", ".join(desc) + "  ") if desc else rr.Skip()
+        # zOMG hack hack hack: overwrite format method to add an arrow
+        repeat.format = self._add_arrow(repeat.format)
         return kind(body, repeat=repeat)
+
+    @staticmethod
+    def _add_arrow(item_format):
+        def add_arrow_format(x, y, width):
+            item = item_format(x, y, width)
+            path = [child for child in item.children if isinstance(child, rr.Path)][-1]
+            path.attrs["marker-end"] = "url(#arrow)"
+            return item
+
+        return add_arrow_format
 
     @_visit.register
     def _visit_success(self, op: Success):
@@ -633,8 +689,12 @@ class _Plotter:
             return f"{chr(op.min_char)} - {chr(op.max_char)}"
         elif isinstance(op, Category):
             return {
+                sre_constants.CATEGORY_UNI_DIGIT: "unicode digit",
+                sre_constants.CATEGORY_UNI_NOT_DIGIT: "not a unicode digit",
                 sre_constants.CATEGORY_UNI_SPACE: "unicode space",
                 sre_constants.CATEGORY_UNI_NOT_SPACE: "not a unicode space",
+                sre_constants.CATEGORY_UNI_WORD: "unicode word character",
+                sre_constants.CATEGORY_UNI_NOT_WORD: "not a unicode word character",
             }[op.category]
         elif isinstance(op, Literal):
             return self._literal_str(op)
@@ -647,7 +707,7 @@ class _Plotter:
 def plot_re(pattern: str):
     parser = _Parser(_Tokenizer(pattern, 0))
     code = parser.parse()
-    return rr.Diagram(_Plotter().plot(code))
+    return _Plotter().plot(code)
 
 
 if __name__ == "__main__":
