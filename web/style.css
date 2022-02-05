@@ -1,0 +1,73 @@
+body {
+    background-color: #779BE7;
+}
+
+a {
+    color: inherit;
+}
+
+main {
+    max-width: 80%;
+    margin: auto;
+    padding: 4rem;
+}
+
+h1, h2 {
+    color: #D6FED0;
+}
+
+h2 {
+    margin-top: 3rem;
+}
+
+@keyframes loading {
+    0% {
+        color: #FFC9B5;
+    }
+    100% {
+        color: #EF798A;
+    }
+}
+
+#loading-indicator {
+    animation: loading 1s infinite;
+    font-size: 2rem;
+}
+
+footer {
+    position: relative;
+    bottom: 0;
+    margin: 0.5rem;
+    text-align: center;
+    width: 100%;
+    color: white;
+}
+
+footer a {
+    color: #416165;
+}
+
+input[type="button"] {
+    display: block;
+    margin-top: 0.5rem;
+}
+
+textarea {
+    width: 100%;
+}
+
+.desc {
+    color: white;
+}
+
+.i {
+    font-style: italic;
+}
+
+#error-msg {
+    color: #FFC9B5;;
+}
+
+#output {
+    margin-top: 2rem;
+}
