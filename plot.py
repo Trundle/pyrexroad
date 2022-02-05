@@ -627,7 +627,7 @@ class _Plotter:
         if op.max_times == 0:
             return rr.Group(body, label="Impossible: must match at most zero times")
         elif op.max_times == 1:
-            return body
+            return rr.Optional(body) if op.min_times == 0 else body
         kind = rr.OneOrMore if op.min_times != 0 else rr.ZeroOrMore
         if op.min_times == op.max_times:
             if op.min_times == sre_constants.MAXREPEAT:
